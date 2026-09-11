@@ -108,9 +108,6 @@ For Software:
 
 
 # Diagrams
-![Workflow](Add your workflow/architecture diagram here)
-*Architecture. The important detail is the split: the price is decided entirely by a pure,
-deterministic function of your voice, and the LLM is only allowed to write dialogue.*
 
 ```
 ┌──────────────────────── BROWSER (app/game-client.tsx) ────────────────────────┐
