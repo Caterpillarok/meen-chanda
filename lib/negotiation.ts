@@ -157,29 +157,29 @@ function getOfferAdjustment(currentPrice: number, playerOffer: number | null) {
 
 const responses: Record<SellerMood, string[]> = {
   "Interested 🙂": [
-    "Chetta, that peaceful voice is making me generous.",
-    "Ayala likes polite customers. I can move a little.",
-    "Soft voice, soft price. You understand business.",
+    "ശരി ശരി, ഇത്രയും മാന്യമായി ചോദിച്ച സ്ഥിതിക്ക് കുറച്ചു കുറയ്ക്കാം ചേട്ടാ!",
+    "നല്ല ഒന്നാംതരം അയലയാണ്! നിങ്ങളുടെ മാന്യമായ സംസാരം കണ്ട് ഞാൻ വിട്ടുതരുന്നു.",
+    "മയമുള്ള ശബ്ദം, മയമുള്ള വില. ബിസിനസ്സ് മനസ്സിലാകുന്ന ആളാണ് നിങ്ങൾ.",
   ],
   "Neutral 😐": [
-    "Hmm. Say your price without making a scene.",
-    "The fish is listening. Keep it civil.",
-    "A normal bargain. What a refreshing surprise.",
+    "മ്മ്… മാർക്കറ്റിൽ കിടന്ന് ബഹളം വെക്കാതെ നേരെ കാര്യം പറ ചേട്ടാ.",
+    "അയല ഇവിടെത്തന്നെ ഉണ്ട്. മര്യാദയ്ക്ക് ചോദിച്ചാൽ നല്ല കച്ചവടം നടക്കും.",
+    "സാധാരണ ഒരു വിലപേശൽ! എന്തായാലും നമുക്ക് നോക്കാം.",
   ],
   "Smug 😏": [
-    "You want a discount and you sound like a cricket commentator?",
-    "The Ayala is not impressed, but I am entertained.",
-    "Chetta, your bargaining has extra seasoning today.",
+    "വില കുറയ്ക്കാനും വേണം, അതിനൊപ്പം ക്രിക്കറ്റ് കമന്ററിയും! എനിക്കിത് ശീലമാണ്.",
+    "നിങ്ങളുടെ ഈ തള്ള് കേട്ട് അയല പോലും ചിരിക്കുന്നുണ്ടാവും ചേട്ടാ!",
+    "ഇത്രയും ധൃതി കാണിച്ചാൽ അയലയുടെ വില അത്ര പെട്ടെന്ന് കുറയില്ല!",
   ],
   "Irritated 😠": [
-    "Why are you shouting at the Ayala?",
-    "Louder voice, higher price. Market rule.",
-    "Chetta, calm down. It is only a fish.",
+    "എന്തിനാ ചേട്ടാ ഇങ്ങനെ മീനിനോട് അലറുന്നത്? ഒച്ച കൂട്ടിയാൽ വിലയും കൂടും!",
+    "ചേട്ടാ ഒന്ന് അടങ്ങ്! ഇത് മീൻ ചന്തയാണ്, ഗുസ്തിക്കളമല്ല.",
+    "ഇത്രയും ദേഷ്യപ്പെട്ടാൽ ഞാൻ ഈ അയല വേറെ ആർക്കെങ്കിലും കൊടുക്കും!",
   ],
   "Personally Offended 🤬": [
-    "At this rate, the fish is becoming more expensive than you.",
-    "You called the fish small? Now you have offended me.",
-    "This is not bargaining. This is a weather warning!",
+    "ഈ നല്ല അയലയെ കണ്ട് കൊച്ചാക്കി സംസാരിക്കുന്നോ? ഞാൻ ഇത് തരില്ല!",
+    "ഇത് വിലപേശലല്ല, വെറും അപമാനിക്കലാണ്! വേണമെങ്കിൽ കടന്നു പോ ചേട്ടാ!",
+    "ഈ വിലയ്ക്ക് അയല വേണമെങ്കിൽ അറബിക്കടലിൽ പോയി നേരിട്ട് പിടിച്ചോ!",
   ],
 };
 

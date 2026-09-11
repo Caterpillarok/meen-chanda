@@ -109,6 +109,12 @@ export default function GameClient() {
   const [interimTranscript, setInterimTranscript] = useState("");
   const [typedTranscript, setTypedTranscript] = useState("");
   const [isListening, setIsListening] = useState(false);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [isGeneratingResponse, setIsGeneratingResponse] = useState(false);
+  const [audioStatus, setAudioStatus] = useState<{
+    type: "playing" | "missing" | "generating";
+    message: string;
+  } | null>(null);
   const [microphoneMessage, setMicrophoneMessage] = useState(
     "Press the microphone and bargain out loud.",
   );
@@ -120,7 +126,7 @@ export default function GameClient() {
   const [aggression, setAggression] = useState(initialAggression);
   const [sellerMood, setSellerMood] = useState<SellerMood>("Neutral 😐");
   const [sellerResponse, setSellerResponse] = useState(
-    "Fresh Ayala! Speak nicely and we can talk price.",
+    "കട്ട ഫ്രഷ് അയല! മാന്യമായി സംസാരിച്ചാൽ വില കുറച്ചു തരാം.",
   );
   const [priceChange, setPriceChange] = useState(0);
   const [history, setHistory] = useState<HistoryItem[]>([]);
@@ -129,6 +135,8 @@ export default function GameClient() {
   const audioContextRef = useRef<AudioContext | null>(null);
   const animationFrameRef = useRef<number | null>(null);
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const currentAudioUrlRef = useRef<string | null>(null);
   const isStoppingRecognitionRef = useRef(false);
   const recognitionFailedRef = useRef(false);
   const startedAtRef = useRef(0);
@@ -140,8 +148,72 @@ export default function GameClient() {
     lastUiUpdate: 0,
   });
 
+  function stopAudio() {
+    if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current.currentTime = 0;
+      audioRef.current.onplay = null;
+      audioRef.current.onended = null;
+      audioRef.current.onerror = null;
+    }
+    setIsPlaying(false);
+  }
+
+  function playAudioUrl(url: string, statusMessage = "Playing Sarvam Malayalam voice") {
+    stopAudio();
+
+    if (typeof window === "undefined" || !url) return;
+
+    try {
+      const audio = new Audio(url);
+      audioRef.current = audio;
+
+      audio.onplay = () => {
+        setIsPlaying(true);
+        setAudioStatus({
+          type: "playing",
+          message: statusMessage,
+        });
+      };
+
+      audio.onended = () => {
+        setIsPlaying(false);
+        setAudioStatus(null);
+      };
+
+      audio.onerror = () => {
+        setIsPlaying(false);
+        setAudioStatus({
+          type: "missing",
+          message: "Sarvam audio playback encountered an issue.",
+        });
+      };
+
+      const playPromise = audio.play();
+      if (playPromise !== undefined) {
+        playPromise.catch((error: unknown) => {
+          setIsPlaying(false);
+          if (error instanceof DOMException && error.name === "AbortError") {
+            return;
+          }
+          setAudioStatus(null);
+        });
+      }
+    } catch {
+      setIsPlaying(false);
+      setAudioStatus(null);
+    }
+  }
+
+  function replayCurrentAudio() {
+    if (currentAudioUrlRef.current) {
+      playAudioUrl(currentAudioUrlRef.current, "Playing Sarvam Malayalam voice");
+    }
+  }
+
   useEffect(() => {
     return () => {
+      stopAudio();
       if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
       recognitionRef.current?.abort();
       streamRef.current?.getTracks().forEach((track) => track.stop());
@@ -164,6 +236,7 @@ export default function GameClient() {
   }
 
   async function startListening() {
+    stopAudio();
     setMicrophoneMessage("Requesting microphone access…");
     setRecognitionMessage("");
     setRecognisedTranscript("");
@@ -292,7 +365,7 @@ export default function GameClient() {
     }
   }
 
-  function settleCurrentRound(fallbackMode = false) {
+  async function settleCurrentRound(fallbackMode = false) {
     const durationSeconds = startedAtRef.current
       ? (Date.now() - startedAtRef.current) / 1000
       : 0;
@@ -321,29 +394,96 @@ export default function GameClient() {
       round,
     });
     stopCapture();
+    stopAudio();
     setAggression(roundAggression);
     setCurrentPrice(result.priceAfter);
     setPriceChange(result.priceChange);
     setSellerMood(result.sellerMood);
-    setSellerResponse(result.sellerResponse);
-    setHistory((previous) => [
-      ...previous,
-      {
-        playerSpeech,
-        aggression: roundAggression.score,
-        priceBefore: currentPrice,
-        priceAfter: result.priceAfter,
-        sellerMood: result.sellerMood,
-        sellerResponse: result.sellerResponse,
-      },
-    ]);
+
+    setIsGeneratingResponse(true);
+    setSellerResponse("മീൻകാരൻ ചേട്ടൻ ആലോചിക്കുന്നു…");
+    setAudioStatus({
+      type: "generating",
+      message: "Sarvam AI is generating seller response…",
+    });
+
+    const roundNumber = round;
+    const priceBeforeRound = currentPrice;
+    const defaultFallbackText = result.sellerResponse;
+
     setOffer("");
     setRecognisedTranscript("");
     setInterimTranscript("");
     setTypedTranscript("");
     startedAtRef.current = 0;
 
-    if (round < GAME_CONFIG.totalRounds) {
+    try {
+      const response = await fetch("/api/seller-response", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          round: roundNumber,
+          totalRounds: GAME_CONFIG.totalRounds,
+          fish: GAME_CONFIG.fish,
+          currentPrice: priceBeforeRound,
+          priceAfter: result.priceAfter,
+          priceChange: result.priceChange,
+          fairPrice: GAME_CONFIG.fairPrice,
+          startingPrice: GAME_CONFIG.startingPrice,
+          playerOffer,
+          playerSpeech,
+          aggressionScore: roundAggression.score,
+          volumeScore: roundAggression.volumeScore,
+          pitchScore: roundAggression.pitchScore,
+          paceScore: roundAggression.paceScore,
+          wordsPerMinute: roundAggression.wordsPerMinute,
+          sellerMood: result.sellerMood,
+        }),
+      });
+
+      const data = await response.json();
+      const dialogueText = data?.sellerText || defaultFallbackText;
+      setIsGeneratingResponse(false);
+      setSellerResponse(dialogueText);
+
+      setHistory((previous) => [
+        ...previous,
+        {
+          playerSpeech,
+          aggression: roundAggression.score,
+          priceBefore: priceBeforeRound,
+          priceAfter: result.priceAfter,
+          sellerMood: result.sellerMood,
+          sellerResponse: dialogueText,
+        },
+      ]);
+
+      if (data?.audio) {
+        currentAudioUrlRef.current = data.audio;
+        playAudioUrl(data.audio, "Sarvam Bulbul v3 (ml-IN)");
+      } else {
+        currentAudioUrlRef.current = null;
+        setAudioStatus(null);
+      }
+    } catch {
+      setIsGeneratingResponse(false);
+      setSellerResponse(defaultFallbackText);
+      currentAudioUrlRef.current = null;
+      setAudioStatus(null);
+      setHistory((previous) => [
+        ...previous,
+        {
+          playerSpeech,
+          aggression: roundAggression.score,
+          priceBefore: priceBeforeRound,
+          priceAfter: result.priceAfter,
+          sellerMood: result.sellerMood,
+          sellerResponse: defaultFallbackText,
+        },
+      ]);
+    }
+
+    if (roundNumber < GAME_CONFIG.totalRounds) {
       setRound((previous) => previous + 1);
       setMicrophoneMessage("Round settled. Bargain again when you are ready.");
     } else {
@@ -352,6 +492,10 @@ export default function GameClient() {
   }
 
   function restartGame() {
+    stopAudio();
+    currentAudioUrlRef.current = null;
+    setIsGeneratingResponse(false);
+    setAudioStatus(null);
     stopCapture();
     setRound(1);
     setCurrentPrice(GAME_CONFIG.startingPrice);
@@ -361,7 +505,7 @@ export default function GameClient() {
     setTypedTranscript("");
     setAggression(initialAggression);
     setSellerMood("Neutral 😐");
-    setSellerResponse("Fresh Ayala! Speak nicely and we can talk price.");
+    setSellerResponse("കട്ട ഫ്രഷ് അയല! മാന്യമായി സംസാരിച്ചാൽ വില കുറച്ചു തരാം.");
     setPriceChange(0);
     setHistory([]);
     setLiveVolume(0);
@@ -386,6 +530,42 @@ export default function GameClient() {
           <div className="fish-icon" aria-hidden="true">🐟</div>
           <h1>{getFinalTitle(currentPrice, averageAggression)}</h1>
           <p className="result-quote">&ldquo;{sellerResponse}&rdquo;</p>
+          <div className="result-speech-controls">
+            <button
+              type="button"
+              className="replay-button"
+              onClick={replayCurrentAudio}
+              aria-label="Replay final seller response"
+              disabled={!currentAudioUrlRef.current || isGeneratingResponse}
+            >
+              <span>🔊</span> Replay response
+            </button>
+            {isGeneratingResponse && (
+              <span className="speaking-indicator" style={{ background: "#8c5b1b" }}>
+                ⏳ ആലോചിക്കുന്നു…
+              </span>
+            )}
+            {isPlaying && (
+              <span className="speaking-indicator" aria-live="polite">
+                <span className="sound-bars" aria-hidden="true">
+                  <span />
+                  <span />
+                  <span />
+                </span>
+                Speaking…
+              </span>
+            )}
+          </div>
+          {audioStatus && (
+            <p
+              className={`status-message ${audioStatus.type === "missing" ? "fallback-message" : ""}`}
+              role="status"
+              style={{ textAlign: "center", margin: "-6px 0 14px" }}
+            >
+              {audioStatus.type === "missing" ? "⚠️ " : "🔊 "}
+              {audioStatus.message}
+            </p>
+          )}
           <div className="final-price">₹{currentPrice}</div>
           <div className="results-grid">
             <div><span>Starting price</span><strong>₹{GAME_CONFIG.startingPrice}</strong></div>
@@ -420,10 +600,54 @@ export default function GameClient() {
         <div className="joke-banner"><span>🎙️</span> YOUR VOICE AFFECTS THE PRICE</div>
 
         <section className="seller-area">
-          <div className="seller-avatar" aria-label="A smiling fish seller">🧔🏽‍♂️</div>
+          <div
+            className={`seller-avatar ${isPlaying ? "is-speaking" : ""}`}
+            aria-label="A smiling fish seller"
+          >
+            🧔🏽‍♂️
+          </div>
           <div className="seller-speech">
-            <p className="mood-label">SELLER IS {sellerMood}</p>
-            <p>&ldquo;{sellerResponse}&rdquo;</p>
+            <div className="seller-speech-header">
+              <p className="mood-label">SELLER IS {sellerMood}</p>
+              {isGeneratingResponse && (
+                <span className="speaking-indicator" style={{ background: "#8c5b1b" }}>
+                  ⏳ ആലോചിക്കുന്നു…
+                </span>
+              )}
+              {isPlaying && (
+                <span className="speaking-indicator" aria-live="polite">
+                  <span className="sound-bars" aria-hidden="true">
+                    <span />
+                    <span />
+                    <span />
+                  </span>
+                  Speaking…
+                </span>
+              )}
+            </div>
+            <p className="seller-quote">&ldquo;{sellerResponse}&rdquo;</p>
+            <div className="seller-speech-footer">
+              <button
+                type="button"
+                className="replay-button"
+                onClick={replayCurrentAudio}
+                aria-label="Replay seller response"
+                title="Hear seller response again"
+                disabled={!currentAudioUrlRef.current || isGeneratingResponse}
+              >
+                <span>🔊</span> Replay
+              </button>
+              {audioStatus && (
+                <span
+                  className={`audio-status ${audioStatus.type === "missing" ? "is-missing" : "is-playing"}`}
+                  role="status"
+                  title={audioStatus.message}
+                >
+                  {audioStatus.type === "missing" ? "⚠️ " : "🔊 "}
+                  {audioStatus.message}
+                </span>
+              )}
+            </div>
           </div>
           <div className="fish-label"><span>🐟</span><strong>{GAME_CONFIG.fish}</strong><small>Fresh catch</small></div>
         </section>
@@ -442,9 +666,21 @@ export default function GameClient() {
           <div className="section-heading voice-heading"><span>2</span><div><h2>Bargain out loud</h2><p>Calm, measured speech makes the seller friendlier.</p></div></div>
           <div className="voice-controls">
             {!isListening ? (
-              <button className="microphone-button" onClick={startListening}><span>🎙️</span> Start listening</button>
+              <button
+                className="microphone-button"
+                onClick={startListening}
+                disabled={isGeneratingResponse}
+              >
+                <span>🎙️</span> Start listening
+              </button>
             ) : (
-              <button className="microphone-button listening" onClick={() => settleCurrentRound()}><span className="pulse-dot" /> Settle this round</button>
+              <button
+                className="microphone-button listening"
+                onClick={() => void settleCurrentRound()}
+                disabled={isGeneratingResponse}
+              >
+                <span className="pulse-dot" /> Settle this round
+              </button>
             )}
             <p className="status-message">{microphoneMessage}</p>
           </div>
@@ -468,7 +704,15 @@ export default function GameClient() {
             <textarea value={typedTranscript} onChange={(event) => setTypedTranscript(event.target.value)} placeholder="ചേട്ടാ, 500 രൂപയ്ക്ക് തരുമോ?" rows={2} />
           </label>
           {recognitionMessage && <p className="fallback-message" role="status">{recognitionMessage}</p>}
-          {!isListening && <button className="fallback-button" onClick={() => settleCurrentRound(true)}>Use typed fallback for this round</button>}
+          {!isListening && (
+            <button
+              className="fallback-button"
+              onClick={() => void settleCurrentRound(true)}
+              disabled={isGeneratingResponse}
+            >
+              Use typed fallback for this round
+            </button>
+          )}
         </section>
 
         <section className="aggression-panel" aria-live="polite">
