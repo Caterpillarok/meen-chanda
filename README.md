@@ -6,8 +6,8 @@
 ### Team Name: [BYTE BAZAAR]
 
 ### Team Members
-- Team Lead: Abhinav - [ADD COLLEGE]
-- Member 2: Shaheem Ali - [ADD COLLEGE]
+- Team Lead: Abhinav - [College of Engineering,Chengannur]
+- Member 2: Shaheem Ali - [College of Engineering,Chengannur]
 
 ### Project Description
 A voice-driven Kerala fish market bargaining game. You haggle out loud with a stubborn
