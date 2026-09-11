@@ -95,21 +95,17 @@ Other scripts: `npm run build`, `npm run start`, `npm run lint`.
 ### Project Documentation
 For Software:
 
-# Screenshots (Add at least 3)
-![Screenshot1](Add screenshot 1 here with proper name)
-*The main game screen: the seller's Malayalam reply with a Replay button, the current /
-fair price panel, the offer input, and the live "Your tone" meter reading Calm → Measured
-→ Raised → Shouting while you speak.*
+# Screenshots 
+![Screenshot1](Initial page)
+*<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/d5918240-93ba-48ce-b9bc-76192852787c" />
 
-![Screenshot2](Add screenshot 2 here with proper name)
-*The Aggression score panel after a round — the 0–100 score, its Volume / Pitch / Pace
-breakdown, and the six-step mood scale showing exactly how many rupees that tone just
-cost or saved you.*
 
-![Screenshot3](Add screenshot 3 here with proper name)
-*The end-of-game result card: your final price, your title (Market Whisperer 🐟 or
-Loudest Loser 📣), savings vs the fair price, and a per-round recap of aggression and
-price.*
+![Screenshot2](Haggle meter)
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/c8f76984-3488-404b-98ec-b94a94d90f75" />
+
+![Screenshot3](score)
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/01422b8e-50b9-496f-9e58-9de47aedf5ad" />
+
 
 # Diagrams
 ![Workflow](Add your workflow/architecture diagram here)
