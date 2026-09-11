@@ -169,8 +169,8 @@ whole project in 30 seconds.*
   room noise floor, and the auto-ranged meter window.
 
 ## Team Contributions
-- Abhinav: [ADD SPECIFIC CONTRIBUTIONS]
-- Shaheem Ali: [ADD SPECIFIC CONTRIBUTIONS]
+- Abhinav M: [Backend and frontend]
+- Shaheem Ali: [Documentation and frontend]
 
 ---
 Made with ❤️ at TinkerHub Useless Projects
