@@ -1,15 +1,76 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import {
   calculateAggression,
+  estimateNoiseFloorRms,
   GAME_CONFIG,
+  getCalibrationOffsetDb,
+  getEffectiveSnrWindow,
   getFinalTitle,
+  getVolumeMeterPercent,
+  getVolumeSnrDb,
+  MAX_SENSITIVITY_OFFSET_DB,
+  MIN_SENSITIVITY_OFFSET_DB,
   type AggressionResult,
   type AudioMeasurements,
   type SellerMood,
   settleRound,
 } from "@/lib/negotiation";
+
+/** Persisted so a venue only has to be dialled in once. */
+const SENSITIVITY_STORAGE_KEY = "meen-chanda:sensitivity-offset-db";
+
+/**
+ * The sensitivity setting lives in localStorage, which is external to React, so it
+ * is exposed through a small store and read with useSyncExternalStore. That keeps
+ * server and client markup consistent on first paint without setting state from an
+ * effect, and lets the animation-frame loop read the current value directly.
+ */
+let sensitivityValue: number | null = null;
+const sensitivityListeners = new Set<() => void>();
+
+function boundSensitivity(value: number) {
+  if (!Number.isFinite(value)) return 0;
+  return Math.min(
+    MAX_SENSITIVITY_OFFSET_DB,
+    Math.max(MIN_SENSITIVITY_OFFSET_DB, Math.round(value)),
+  );
+}
+
+function getSensitivity() {
+  if (sensitivityValue === null) {
+    try {
+      const saved = window.localStorage.getItem(SENSITIVITY_STORAGE_KEY);
+      sensitivityValue = saved === null ? 0 : boundSensitivity(Number(saved));
+    } catch {
+      // Private browsing or blocked storage: use the default window.
+      sensitivityValue = 0;
+    }
+  }
+  return sensitivityValue;
+}
+
+/** The server has no microphone and no storage, so it always renders the default. */
+function getServerSensitivity() {
+  return 0;
+}
+
+function subscribeSensitivity(onChange: () => void) {
+  sensitivityListeners.add(onChange);
+  return () => sensitivityListeners.delete(onChange);
+}
+
+function writeSensitivity(value: number) {
+  sensitivityValue = boundSensitivity(value);
+  try {
+    window.localStorage.setItem(SENSITIVITY_STORAGE_KEY, String(sensitivityValue));
+  } catch {
+    // Persistence is a convenience; the session still works without it.
+  }
+  sensitivityListeners.forEach((listener) => listener());
+  return sensitivityValue;
+}
 
 type SpeechRecognitionAlternativeLike = { transcript: string };
 type SpeechRecognitionResultLike = {
@@ -34,13 +95,73 @@ type SpeechRecognitionLike = {
 };
 type SpeechRecognitionConstructor = new () => SpeechRecognitionLike;
 
-const MINIMUM_VOICE_RMS = 0.008;
+/**
+ * Cheap absolute gate for the autocorrelation pass only — it exists to avoid
+ * running an expensive pitch search over digital silence, not to decide what
+ * counts as the player's voice. That decision is made at settle time, relative
+ * to the measured noise floor, because absolute RMS depends on microphone gain.
+ */
+const PITCH_DETECTION_MIN_RMS = 0.001;
+/**
+ * Upper bound on how much time a single analysis frame may contribute to the
+ * measured speaking duration. Frames normally arrive every ~16ms; a much larger
+ * gap means the tab was throttled rather than that the player spoke for that long.
+ */
+const MAX_FRAME_DELTA_MS = 100;
+/** Below this much voiced audio, pace is treated as unmeasurable. */
+const MINIMUM_VOICED_SECONDS_FOR_PACE = 0.4;
+/** Bounds memory for a very long round (~60fps, so this is roughly two minutes). */
+const MAX_ANALYSIS_FRAMES = 8000;
+/**
+ * Below this, a frame is treated as a dropout rather than as quiet room noise.
+ * The AudioContext emits digital silence while it spins up, and letting those
+ * frames into the estimate is what dragged the floor to its clamp and pinned the
+ * first round at full loudness. Real rooms sit well above this once a mic is live.
+ */
+const NEAR_SILENCE_RMS = 0.00001;
+/**
+ * The background level is estimated as a low percentile of the most recent few
+ * seconds of audio. This shape of estimator is deliberate, because the two obvious
+ * alternatives each fail in an opposite direction:
+ *
+ *  - A running MINIMUM is captured permanently by a single low outlier (a startup
+ *    ramp or buffer glitch), leaving the floor far below the real background so
+ *    that even silence reads as loud.
+ *  - A percentile over the WHOLE round drifts upward as speech accumulates, until
+ *    the "background" is the player's own voice and the meter decays to nothing.
+ *
+ * A percentile ignores outliers, and bounding it to a recent window stops it
+ * drifting, so it can both rise and fall to follow the room.
+ */
+const FLOOR_WINDOW_FRAMES = 180;
+/** Samples required before any reading is reported (~0.5s at 60fps). */
+const MIN_FLOOR_SAMPLES = 30;
+/**
+ * Where the loudest voice heard so far should land on the meter. The window is
+ * auto-ranged so that peak maps here, which makes the meter monotonic in loudness
+ * no matter how the room or the microphone behaves: speaking up always reads
+ * higher, easing off always reads lower. It also self-corrects a floor estimate
+ * that came out too low, which previously saturated the meter at every level.
+ */
+const AUTO_RANGE_TARGET_DB = 41;
+/** Smoothing for the live meter so it tracks speech rather than flickering per frame. */
+const LIVE_METER_SMOOTHING = 0.55;
+/** Safety cap so a permanently failing recogniser cannot restart in a tight loop. */
+const MAX_RECOGNITION_RESTARTS = 10;
+/**
+ * Recognition errors that are part of normal operation rather than failures.
+ * "aborted" fires whenever the app itself stops the recogniser (settling a round
+ * or discarding a take) and "no-speech" simply means the player paused.
+ */
+const BENIGN_RECOGNITION_ERRORS = new Set(["aborted", "no-speech"]);
+
+type AnalysisFrame = { rms: number; pitch: number; deltaMs: number };
 
 function detectPitch(samples: Float32Array, sampleRate: number) {
   let rms = 0;
   for (const sample of samples) rms += sample * sample;
   rms = Math.sqrt(rms / samples.length);
-  if (rms < MINIMUM_VOICE_RMS) return 0;
+  if (rms < PITCH_DETECTION_MIN_RMS) return 0;
 
   const minLag = Math.floor(sampleRate / 350);
   const maxLag = Math.floor(sampleRate / 85);
@@ -91,6 +212,8 @@ const initialAggression: AggressionResult = {
   pitchScore: 0,
   paceScore: 0,
   wordsPerMinute: 0,
+  volumeSnrDb: 0,
+  noiseFloorRms: 0,
 };
 
 type RecognitionStatus =
@@ -100,6 +223,22 @@ type RecognitionStatus =
   | "ended"
   | "unavailable"
   | "error";
+
+/**
+ * Plain-language reading of the live meter. The whole point of the game is that
+ * players instinctively get louder to bargain harder, so the tone is named and
+ * its price consequence spelled out while they are still speaking.
+ */
+const TONE_BANDS = [
+  { limit: 25, label: "Calm", hint: "Seller is warming up — price falling", tone: "is-calm" },
+  { limit: 55, label: "Measured", hint: "Steady. Soften further to push the price down", tone: "is-measured" },
+  { limit: 80, label: "Raised", hint: "Seller is bristling — price about to climb", tone: "is-raised" },
+  { limit: Infinity, label: "Shouting", hint: "Ayala is getting expensive!", tone: "is-shouting" },
+] as const;
+
+function getToneBand(meterPercent: number) {
+  return TONE_BANDS.find((band) => meterPercent < band.limit) ?? TONE_BANDS[3];
+}
 
 export default function GameClient() {
   const [round, setRound] = useState(1);
@@ -121,7 +260,23 @@ export default function GameClient() {
   const [recognitionMessage, setRecognitionMessage] = useState("");
   const [recognitionStatus, setRecognitionStatus] =
     useState<RecognitionStatus>("checking");
+  // The typed input is a fallback, not a primary control, so it stays hidden
+  // until recognition actually fails or the player asks for it.
+  const [showTypedFallback, setShowTypedFallback] = useState(false);
+  /**
+   * Shifts the loudness window to match the room and microphone. Absolute dB
+   * thresholds cannot be right for every setup, so this is adjustable at runtime
+   * and persisted, which means a venue can be dialled in once before a demo.
+   */
+  const sensitivityOffsetDb = useSyncExternalStore(
+    subscribeSensitivity,
+    getSensitivity,
+    getServerSensitivity,
+  );
+  const [calibrationMessage, setCalibrationMessage] = useState("");
   const [liveVolume, setLiveVolume] = useState(0);
+  const [liveSnrDb, setLiveSnrDb] = useState(0);
+  const [liveNoiseFloor, setLiveNoiseFloor] = useState(0);
   const [livePitch, setLivePitch] = useState(0);
   const [aggression, setAggression] = useState(initialAggression);
   const [sellerMood, setSellerMood] = useState<SellerMood>("Neutral 😐");
@@ -130,23 +285,83 @@ export default function GameClient() {
   );
   const [priceChange, setPriceChange] = useState(0);
   const [history, setHistory] = useState<HistoryItem[]>([]);
+  // Held as state, not a ref: the Replay buttons derive their disabled state
+  // from it during render, so a change must trigger a re-render.
+  const [currentAudioUrl, setCurrentAudioUrl] = useState<string | null>(null);
 
   const streamRef = useRef<MediaStream | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const animationFrameRef = useRef<number | null>(null);
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
-  const currentAudioUrlRef = useRef<string | null>(null);
   const isStoppingRecognitionRef = useRef(false);
   const recognitionFailedRef = useRef(false);
-  const startedAtRef = useRef(0);
-  const analysisRef = useRef({
-    volumeTotal: 0,
-    voiceFrames: 0,
-    pitchTotal: 0,
-    pitchFrames: 0,
+  /**
+   * Chrome ends a continuous recognition session on its own after a pause, so the
+   * session is restarted transparently. Transcript text is carried across those
+   * restarts because each new session reports results from index 0.
+   */
+  const recognitionRestartsRef = useRef(0);
+  const committedTranscriptRef = useRef("");
+  const sessionFinalTranscriptRef = useRef("");
+  const isSettlingRef = useRef(false);
+  /**
+   * Loudest voice heard so far this game, in dB above the background. Persists
+   * across rounds so the meter's range keeps widening rather than resetting.
+   */
+  const peakDbRef = useRef(0);
+
+  /**
+   * Sensitivity actually applied: the player's own setting plus however much the
+   * window must shift so their loudest voice reaches the top of the meter. Used
+   * for both the live meter and the round score so the two always agree.
+   */
+  function getEffectiveOffsetDb() {
+    return getSensitivity() + Math.max(0, peakDbRef.current - AUTO_RANGE_TARGET_DB);
+  }
+  const analysisRef = useRef<{
+    frames: AnalysisFrame[];
+    lastUiUpdate: number;
+    lastFrameAt: number;
+    captureStartedAt: number;
+    /** Recent frame loudness, newest last, capped to FLOOR_WINDOW_FRAMES. */
+    recentRms: number[];
+    /** Live estimate of the background level, or null until enough samples exist. */
+    noiseFloor: number | null;
+    /** Quietest background level seen all round; the value the round is scored on. */
+    scoringFloor: number | null;
+    smoothedRms: number;
+  }>({
+    frames: [],
     lastUiUpdate: 0,
+    lastFrameAt: 0,
+    captureStartedAt: 0,
+    recentRms: [],
+    noiseFloor: null,
+    scoringFloor: null,
+    smoothedRms: 0,
   });
+
+  function applySensitivity(offsetDb: number, message = "") {
+    writeSensitivity(offsetDb);
+    setCalibrationMessage(message);
+  }
+
+  /**
+   * Anchors the loudness window to the voice being used right now. The player
+   * speaks normally, presses this, and their current level becomes "measured".
+   */
+  function calibrateToCurrentVoice() {
+    if (!liveSnrDb) {
+      setCalibrationMessage("Speak first, then calibrate — no loudness measured yet.");
+      return;
+    }
+    const offset = getCalibrationOffsetDb(liveSnrDb);
+    applySensitivity(
+      offset,
+      `Calibrated: ${liveSnrDb} dB is now your normal speaking voice.`,
+    );
+  }
 
   function stopAudio() {
     if (audioRef.current) {
@@ -196,6 +411,16 @@ export default function GameClient() {
           if (error instanceof DOMException && error.name === "AbortError") {
             return;
           }
+          // The reply is fetched before it can be played, which breaks the user
+          // gesture chain, so some browsers refuse to start playback. Say so and
+          // point at Replay, which runs inside a fresh click.
+          if (error instanceof DOMException && error.name === "NotAllowedError") {
+            setAudioStatus({
+              type: "missing",
+              message: "Browser blocked autoplay — press Replay to hear the seller.",
+            });
+            return;
+          }
           setAudioStatus(null);
         });
       }
@@ -206,8 +431,8 @@ export default function GameClient() {
   }
 
   function replayCurrentAudio() {
-    if (currentAudioUrlRef.current) {
-      playAudioUrl(currentAudioUrlRef.current, "Playing Sarvam Malayalam voice");
+    if (currentAudioUrl) {
+      playAudioUrl(currentAudioUrl, "Playing Sarvam Malayalam voice");
     }
   }
 
@@ -235,6 +460,23 @@ export default function GameClient() {
     if (getRecognitionConstructor()) setRecognitionStatus("ready");
   }
 
+  /**
+   * Abandons the current recording without scoring it. Previously the only way
+   * out of listening mode was to settle, so a misfired start or a coughing fit
+   * had to be committed to the price.
+   */
+  function cancelListening() {
+    stopCapture();
+    setRecognisedTranscript("");
+    setInterimTranscript("");
+    setLiveVolume(0);
+    setLiveSnrDb(0);
+    setLiveNoiseFloor(0);
+    setLivePitch(0);
+    setRecognitionMessage("");
+    setMicrophoneMessage("Recording discarded. Start again when you are ready.");
+  }
+
   async function startListening() {
     stopAudio();
     setMicrophoneMessage("Requesting microphone access…");
@@ -243,19 +485,41 @@ export default function GameClient() {
     setInterimTranscript("");
     setTypedTranscript("");
     setLiveVolume(0);
+    setLiveSnrDb(0);
+    setLiveNoiseFloor(0);
     setLivePitch(0);
     isStoppingRecognitionRef.current = false;
     recognitionFailedRef.current = false;
+    recognitionRestartsRef.current = 0;
+    committedTranscriptRef.current = "";
+    sessionFinalTranscriptRef.current = "";
     analysisRef.current = {
-      volumeTotal: 0,
-      voiceFrames: 0,
-      pitchTotal: 0,
-      pitchFrames: 0,
+      frames: [],
       lastUiUpdate: 0,
+      lastFrameAt: 0,
+      // Set properly once the stream is live. Timing spin-up from here would be
+      // wrong: the microphone permission prompt alone outlasts the skip window.
+      captureStartedAt: 0,
+      recentRms: [],
+      noiseFloor: null,
+      scoringFloor: null,
+      smoothedRms: 0,
     };
 
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      // autoGainControl must be off: it normalises the input level, so shouting
+      // and speaking softly would arrive at the analyser at nearly the same RMS.
+      // noiseSuppression must also be off: it gates near-silence down towards
+      // zero, which would destroy the noise floor that the SNR measurement is
+      // taken against. echoCancellation stays on so the seller's own TTS reply
+      // playing through the speakers is not measured as the player's voice.
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          autoGainControl: false,
+          noiseSuppression: false,
+          echoCancellation: true,
+        },
+      });
       const audioContext = new AudioContext();
       const source = audioContext.createMediaStreamSource(stream);
       const analyser = audioContext.createAnalyser();
@@ -264,7 +528,12 @@ export default function GameClient() {
       await audioContext.resume();
       streamRef.current = stream;
       audioContextRef.current = audioContext;
-      startedAtRef.current = Date.now();
+      // Spin-up is measured from the moment audio can actually flow. On the first
+      // round the permission prompt can take seconds, and timing from the button
+      // press meant the skip window expired before a single frame arrived — so the
+      // AudioContext's startup silence was counted as room noise, collapsing the
+      // noise floor and pinning the first round at full loudness.
+      analysisRef.current.captureStartedAt = Date.now();
       setIsListening(true);
       setMicrophoneMessage("Listening… speak normally, then settle this round.");
 
@@ -276,18 +545,64 @@ export default function GameClient() {
         const rms = Math.sqrt(squareSum / timeDomainData.length);
         const pitch = detectPitch(timeDomainData, audioContext.sampleRate);
 
-        if (rms >= MINIMUM_VOICE_RMS) {
-          analysisRef.current.volumeTotal += rms;
-          analysisRef.current.voiceFrames += 1;
-          if (pitch > 0) {
-            analysisRef.current.pitchTotal += pitch;
-            analysisRef.current.pitchFrames += 1;
+        // Measure elapsed time per frame so pace reflects actual speaking time,
+        // not the wall-clock time since the microphone was opened.
+        const now = Date.now();
+        const previousFrameAt = analysisRef.current.lastFrameAt;
+        analysisRef.current.lastFrameAt = now;
+        // Clamp the delta so a backgrounded tab or a stalled frame cannot
+        // inflate the measured speaking duration.
+        const frameDeltaMs = previousFrameAt
+          ? Math.min(now - previousFrameAt, MAX_FRAME_DELTA_MS)
+          : 0;
+
+        if (analysisRef.current.frames.length < MAX_ANALYSIS_FRAMES) {
+          analysisRef.current.frames.push({ rms, pitch, deltaMs: frameDeltaMs });
+        }
+
+        // Feed the sliding window used to estimate the background level. Digital
+        // silence is a dropout, not room noise, so it never enters the sample.
+        const analysis = analysisRef.current;
+        if (rms > NEAR_SILENCE_RMS) {
+          analysis.recentRms.push(rms);
+          if (analysis.recentRms.length > FLOOR_WINDOW_FRAMES) {
+            analysis.recentRms.shift();
           }
         }
 
+        analysisRef.current.smoothedRms =
+          analysisRef.current.smoothedRms * LIVE_METER_SMOOTHING +
+          rms * (1 - LIVE_METER_SMOOTHING);
+
         if (Date.now() - analysisRef.current.lastUiUpdate > 120) {
-          setLiveVolume(Math.min(100, Math.round((rms / GAME_CONFIG.audio.loudRms) * 100)));
+          // Recompute the background level from the recent window. estimateNoiseFloorRms
+          // is the same percentile helper the round is scored with, so the meter and
+          // the score can never disagree about what the room sounds like.
+          if (analysis.recentRms.length >= MIN_FLOOR_SAMPLES) {
+            analysis.noiseFloor = estimateNoiseFloorRms(analysis.recentRms);
+            if (
+              analysis.scoringFloor === null ||
+              analysis.noiseFloor < analysis.scoringFloor
+            ) {
+              analysis.scoringFloor = analysis.noiseFloor;
+            }
+          }
+          const establishedFloor = analysis.noiseFloor;
+          const liveSnrDb =
+            establishedFloor === null
+              ? 0
+              : getVolumeSnrDb(analysisRef.current.smoothedRms, establishedFloor);
+          // Widen the range to the loudest voice heard so far, so the meter always
+          // spans this player's actual range instead of a guessed dB window.
+          if (liveSnrDb > peakDbRef.current) peakDbRef.current = liveSnrDb;
+          setLiveVolume(
+            establishedFloor === null
+              ? 0
+              : getVolumeMeterPercent(liveSnrDb, getEffectiveOffsetDb()),
+          );
           setLivePitch(Math.round(pitch));
+          setLiveSnrDb(Math.round(liveSnrDb));
+          setLiveNoiseFloor(establishedFloor ?? 0);
           analysisRef.current.lastUiUpdate = Date.now();
         }
         animationFrameRef.current = requestAnimationFrame(readAudio);
@@ -303,56 +618,95 @@ export default function GameClient() {
         return;
       }
 
-      const recognition = new Recognition();
-      recognition.lang = "ml-IN";
-      recognition.continuous = true;
-      recognition.interimResults = true;
-      recognition.onstart = () => {
-        setRecognitionStatus("listening");
-        setRecognitionMessage("Listening for Malayalam speech (ml-IN)…");
-      };
-      recognition.onresult = (event) => {
-        let finalText = "";
-        let interimText = "";
-        for (let index = 0; index < event.results.length; index += 1) {
-          const result = event.results[index];
-          if (result.isFinal) {
-            finalText += `${result[0].transcript} `;
-          } else {
-            interimText += `${result[0].transcript} `;
+      const beginRecognition = () => {
+        const recognition = new Recognition();
+        recognition.lang = "ml-IN";
+        recognition.continuous = true;
+        recognition.interimResults = true;
+        recognition.onstart = () => {
+          setRecognitionStatus("listening");
+          setRecognitionMessage("Listening for Malayalam speech (ml-IN)…");
+        };
+        recognition.onresult = (event) => {
+          let finalText = "";
+          let interimText = "";
+          for (let index = 0; index < event.results.length; index += 1) {
+            const result = event.results[index];
+            if (result.isFinal) {
+              finalText += `${result[0].transcript} `;
+            } else {
+              interimText += `${result[0].transcript} `;
+            }
           }
-        }
-        setRecognisedTranscript(finalText.trim());
-        setInterimTranscript(interimText.trim());
-      };
-      recognition.onerror = (event) => {
-        recognitionFailedRef.current = true;
-        setRecognitionStatus("error");
-        setInterimTranscript("");
-        setRecognitionMessage(
-          `Malayalam recognition could not continue (${event.error}). Audio analysis is still listening; type your bargain if needed.`,
-        );
-      };
-      recognition.onend = () => {
-        recognitionRef.current = null;
-        if (!isStoppingRecognitionRef.current && !recognitionFailedRef.current) {
-          setRecognitionStatus("ended");
+          // Each recognition session numbers its results from zero, so the text
+          // finalised by earlier sessions is kept separately and prepended.
+          sessionFinalTranscriptRef.current = finalText.trim();
+          setRecognisedTranscript(
+            [committedTranscriptRef.current, sessionFinalTranscriptRef.current]
+              .filter(Boolean)
+              .join(" "),
+          );
+          setInterimTranscript(interimText.trim());
+        };
+        recognition.onerror = (event) => {
+          // Do not surface an error for events that are part of normal operation.
+          // Reporting "aborted" as a failure was especially misleading, because the
+          // app aborts the recogniser itself every time a round is settled or a
+          // take is discarded.
+          if (BENIGN_RECOGNITION_ERRORS.has(event.error)) {
+            if (event.error === "no-speech") {
+              setRecognitionMessage(
+                "No Malayalam words picked up yet — keep bargaining, your tone is still being measured.",
+              );
+            }
+            return;
+          }
+          recognitionFailedRef.current = true;
+          setRecognitionStatus("error");
           setInterimTranscript("");
           setRecognitionMessage(
-            "Malayalam recognition stopped. Audio analysis is still listening; type your bargain or settle the round.",
+            `Malayalam recognition could not continue (${event.error}). Audio analysis is still listening; type your bargain if needed.`,
+          );
+        };
+        recognition.onend = () => {
+          recognitionRef.current = null;
+          if (isStoppingRecognitionRef.current || recognitionFailedRef.current) return;
+
+          // Carry finalised text forward, then transparently resume. Chrome stops a
+          // continuous session by itself after a pause, which previously ended
+          // recognition for the rest of the round.
+          committedTranscriptRef.current = [
+            committedTranscriptRef.current,
+            sessionFinalTranscriptRef.current,
+          ]
+            .filter(Boolean)
+            .join(" ");
+          sessionFinalTranscriptRef.current = "";
+
+          if (recognitionRestartsRef.current >= MAX_RECOGNITION_RESTARTS) {
+            setRecognitionStatus("ended");
+            setInterimTranscript("");
+            setRecognitionMessage(
+              "Malayalam recognition stopped. Audio analysis is still listening; type your bargain or settle the round.",
+            );
+            return;
+          }
+          recognitionRestartsRef.current += 1;
+          beginRecognition();
+        };
+        recognitionRef.current = recognition;
+        try {
+          recognition.start();
+        } catch {
+          recognitionFailedRef.current = true;
+          setRecognitionStatus("error");
+          setRecognitionMessage(
+            "Malayalam recognition could not start. Audio analysis is still listening; type your bargain instead.",
           );
         }
       };
-      recognitionRef.current = recognition;
-      try {
-        recognition.start();
-      } catch {
-        recognitionFailedRef.current = true;
-        setRecognitionStatus("error");
-        setRecognitionMessage(
-          "Malayalam recognition could not start. Audio analysis is still listening; type your bargain instead.",
-        );
-      }
+
+      beginRecognition();
     } catch (error) {
       const message =
         error instanceof DOMException && error.name === "NotAllowedError"
@@ -366,23 +720,49 @@ export default function GameClient() {
   }
 
   async function settleCurrentRound(fallbackMode = false) {
-    const durationSeconds = startedAtRef.current
-      ? (Date.now() - startedAtRef.current) / 1000
-      : 0;
+    // Guard against a second settle being kicked off while one is already in
+    // flight, which would score the same round twice against a stale price.
+    if (isSettlingRef.current) return;
+    isSettlingRef.current = true;
+
+    // The noise floor is only knowable once the round is over, so every frame was
+    // recorded raw and is reduced here. Deciding what counted as "voice" relative
+    // to that floor is what makes the score independent of microphone gain.
+    const frames = analysisRef.current.frames;
+    // Prefer the quietest background the adaptive detector settled on. The
+    // percentile is only a fallback for a round too short to seed the estimate.
+    const noiseFloorRms =
+      analysisRef.current.scoringFloor ??
+      estimateNoiseFloorRms(frames.map((frame) => frame.rms));
+    const voiceGate = Math.max(
+      noiseFloorRms * GAME_CONFIG.audio.voiceGateRatio,
+      GAME_CONFIG.audio.silenceRms,
+    );
+    const voicedFrames = frames.filter((frame) => frame.rms >= voiceGate);
+    const pitchedFrames = voicedFrames.filter((frame) => frame.pitch > 0);
+    const voicedMs = voicedFrames.reduce((total, frame) => total + frame.deltaMs, 0);
+
+    // Only count time where the player was actually voicing, so a long silent
+    // pause before settling cannot make fast speech look calm.
+    const voicedSeconds = voicedMs / 1000;
+    const durationSeconds =
+      voicedSeconds >= MINIMUM_VOICED_SECONDS_FOR_PACE ? voicedSeconds : 0;
     const capturedSpeech = recognisedTranscript.trim() || interimTranscript.trim();
     const playerSpeech = capturedSpeech || typedTranscript.trim() || "No words recognised — voice analysis only.";
     const audio: AudioMeasurements = {
-      averageVolume:
-        analysisRef.current.voiceFrames > 0
-          ? analysisRef.current.volumeTotal / analysisRef.current.voiceFrames
-          : 0,
-      averagePitch:
-        analysisRef.current.pitchFrames > 0
-          ? analysisRef.current.pitchTotal / analysisRef.current.pitchFrames
-          : 0,
+      averageVolume: voicedFrames.length
+        ? voicedFrames.reduce((total, frame) => total + frame.rms, 0) /
+          voicedFrames.length
+        : 0,
+      noiseFloorRms,
+      sensitivityOffsetDb: getEffectiveOffsetDb(),
+      averagePitch: pitchedFrames.length
+        ? pitchedFrames.reduce((total, frame) => total + frame.pitch, 0) /
+          pitchedFrames.length
+        : 0,
       wordCount: capturedSpeech ? capturedSpeech.split(/\s+/).length : 0,
       durationSeconds,
-      hadVoice: analysisRef.current.voiceFrames > 0,
+      hadVoice: voicedFrames.length > 0,
       fallbackMode,
     };
     const roundAggression = calculateAggression(audio);
@@ -415,7 +795,6 @@ export default function GameClient() {
     setRecognisedTranscript("");
     setInterimTranscript("");
     setTypedTranscript("");
-    startedAtRef.current = 0;
 
     try {
       const response = await fetch("/api/seller-response", {
@@ -459,17 +838,25 @@ export default function GameClient() {
       ]);
 
       if (data?.audio) {
-        currentAudioUrlRef.current = data.audio;
+        setCurrentAudioUrl(data.audio);
         playAudioUrl(data.audio, "Sarvam Bulbul v3 (ml-IN)");
       } else {
-        currentAudioUrlRef.current = null;
-        setAudioStatus(null);
+        // Text arrived but speech synthesis did not. Say so explicitly rather
+        // than leaving a silently disabled replay button next to a fresh quote.
+        setCurrentAudioUrl(null);
+        setAudioStatus({
+          type: "missing",
+          message: "Voice unavailable for this reply — showing text only.",
+        });
       }
     } catch {
       setIsGeneratingResponse(false);
       setSellerResponse(defaultFallbackText);
-      currentAudioUrlRef.current = null;
-      setAudioStatus(null);
+      setCurrentAudioUrl(null);
+      setAudioStatus({
+        type: "missing",
+        message: "Could not reach the seller's voice — showing text only.",
+      });
       setHistory((previous) => [
         ...previous,
         {
@@ -489,11 +876,14 @@ export default function GameClient() {
     } else {
       setMicrophoneMessage("The market has spoken. Your final price is locked.");
     }
+
+    isSettlingRef.current = false;
   }
 
   function restartGame() {
     stopAudio();
-    currentAudioUrlRef.current = null;
+    setCurrentAudioUrl(null);
+    isSettlingRef.current = false;
     setIsGeneratingResponse(false);
     setAudioStatus(null);
     stopCapture();
@@ -503,12 +893,16 @@ export default function GameClient() {
     setRecognisedTranscript("");
     setInterimTranscript("");
     setTypedTranscript("");
+    setShowTypedFallback(false);
+    peakDbRef.current = 0;
     setAggression(initialAggression);
     setSellerMood("Neutral 😐");
     setSellerResponse("കട്ട ഫ്രഷ് അയല! മാന്യമായി സംസാരിച്ചാൽ വില കുറച്ചു തരാം.");
     setPriceChange(0);
     setHistory([]);
     setLiveVolume(0);
+    setLiveSnrDb(0);
+    setLiveNoiseFloor(0);
     setLivePitch(0);
     setMicrophoneMessage("Press the microphone and bargain out loud.");
     setRecognitionMessage("");
@@ -516,6 +910,16 @@ export default function GameClient() {
   }
 
   const isFinished = history.length === GAME_CONFIG.totalRounds;
+  const toneBand = getToneBand(liveVolume);
+  const isRoomMeasured = liveNoiseFloor > 0;
+  const effectiveWindow = getEffectiveSnrWindow(sensitivityOffsetDb);
+  // Reveal the typed input automatically the moment speech recognition cannot
+  // carry the round, so the player is never left without a way to answer.
+  const typedFallbackVisible =
+    showTypedFallback ||
+    recognitionStatus === "unavailable" ||
+    recognitionStatus === "error" ||
+    recognitionStatus === "ended";
   const averageAggression = history.length
     ? Math.round(history.reduce((total, item) => total + item.aggression, 0) / history.length)
     : 0;
@@ -536,7 +940,7 @@ export default function GameClient() {
               className="replay-button"
               onClick={replayCurrentAudio}
               aria-label="Replay final seller response"
-              disabled={!currentAudioUrlRef.current || isGeneratingResponse}
+              disabled={!currentAudioUrl || isGeneratingResponse}
             >
               <span>🔊</span> Replay response
             </button>
@@ -595,7 +999,35 @@ export default function GameClient() {
             <p className="eyebrow">MEEN CHANDA</p>
             <h1>Fish Market Haggling Simulator</h1>
           </div>
-          <div className="round-badge">ROUND {round} / {GAME_CONFIG.totalRounds}</div>
+          <div className="round-tracker">
+            <div className="round-badge">ROUND {round} / {GAME_CONFIG.totalRounds}</div>
+            <ol
+              className="round-dots"
+              aria-label={`Round ${round} of ${GAME_CONFIG.totalRounds}`}
+            >
+              {Array.from({ length: GAME_CONFIG.totalRounds }, (_, index) => {
+                const roundNumber = index + 1;
+                const state =
+                  roundNumber < round
+                    ? "is-done"
+                    : roundNumber === round
+                      ? "is-current"
+                      : "is-upcoming";
+                return (
+                  <li key={roundNumber} className={state}>
+                    <span className="sr-only">
+                      Round {roundNumber}{" "}
+                      {state === "is-done"
+                        ? "settled"
+                        : state === "is-current"
+                          ? "in progress"
+                          : "not started"}
+                    </span>
+                  </li>
+                );
+              })}
+            </ol>
+          </div>
         </header>
         <div className="joke-banner"><span>🎙️</span> YOUR VOICE AFFECTS THE PRICE</div>
 
@@ -633,7 +1065,7 @@ export default function GameClient() {
                 onClick={replayCurrentAudio}
                 aria-label="Replay seller response"
                 title="Hear seller response again"
-                disabled={!currentAudioUrlRef.current || isGeneratingResponse}
+                disabled={!currentAudioUrl || isGeneratingResponse}
               >
                 <span>🔊</span> Replay
               </button>
@@ -653,7 +1085,11 @@ export default function GameClient() {
         </section>
 
         <section className="price-panel" aria-live="polite">
-          <div><span>Current price</span><strong>₹{currentPrice}</strong></div>
+          <div>
+            <span>Current price</span>
+            {/* Keyed on the price so the highlight animation replays on every change. */}
+            <strong key={currentPrice} className="price-current">₹{currentPrice}</strong>
+          </div>
           <div><span>Fair price</span><strong>₹{GAME_CONFIG.fairPrice}</strong></div>
           <div className={priceChange > 0 ? "price-up" : priceChange < 0 ? "price-down" : "price-still"}>
             <span>Last change</span><strong>{priceChange === 0 ? "—" : `${priceChange > 0 ? "↑" : "↓"} ₹${Math.abs(priceChange)}`}</strong>
@@ -674,21 +1110,122 @@ export default function GameClient() {
                 <span>🎙️</span> Start listening
               </button>
             ) : (
-              <button
-                className="microphone-button listening"
-                onClick={() => void settleCurrentRound()}
-                disabled={isGeneratingResponse}
-              >
-                <span className="pulse-dot" /> Settle this round
-              </button>
+              <div className="voice-button-row">
+                <button
+                  className="microphone-button listening"
+                  onClick={() => void settleCurrentRound()}
+                  disabled={isGeneratingResponse}
+                >
+                  <span className="pulse-dot" /> Settle this round
+                </button>
+                <button
+                  type="button"
+                  className="ghost-button"
+                  onClick={cancelListening}
+                  disabled={isGeneratingResponse}
+                >
+                  Discard
+                </button>
+              </div>
             )}
             <p className="status-message">{microphoneMessage}</p>
           </div>
           <div className="live-analysis">
-            <div><span>Live volume</span><div className="mini-meter"><i style={{ width: `${liveVolume}%` }} /></div><strong>{liveVolume}%</strong></div>
+            <div className={`tone-card ${toneBand.tone} ${isListening ? "is-live" : ""}`}>
+              <span>Your tone</span>
+              <div
+                className="mini-meter"
+                role="progressbar"
+                aria-valuenow={liveVolume}
+                aria-valuemin={0}
+                aria-valuemax={100}
+                aria-label="Live speaking loudness"
+              >
+                <i style={{ width: `${liveVolume}%` }} />
+              </div>
+              <strong>
+                {!isListening
+                  ? "—"
+                  : isRoomMeasured
+                    ? `${toneBand.label} · ${liveSnrDb} dB`
+                    : "Tuning in…"}
+              </strong>
+              <small>
+                {!isListening
+                  ? "Press start to measure your voice"
+                  : isRoomMeasured
+                    ? toneBand.hint
+                    : "Finding the background level — start talking whenever"}
+              </small>
+            </div>
             <div><span>Live pitch</span><strong>{livePitch ? `${livePitch} Hz` : "—"}</strong></div>
             <div><span>Malayalam recognition</span><strong>{recognitionStatus === "listening" ? "Listening · ml-IN" : recognitionStatus === "ready" ? "Ready · ml-IN" : recognitionStatus === "checking" ? "Checking…" : "Fallback ready"}</strong></div>
           </div>
+          <details className="diagnostics">
+            <summary>Mic setup &amp; diagnostics</summary>
+            <div className="diagnostics-grid">
+              <div><span>Loudness</span><strong>{liveSnrDb} dB</strong></div>
+              <div>
+                <span>Noise floor</span>
+                <strong>{liveNoiseFloor ? liveNoiseFloor.toExponential(1) : "measuring…"}</strong>
+              </div>
+              <div>
+                <span>Active window</span>
+                <strong>
+                  {effectiveWindow.quiet}–{effectiveWindow.loud} dB
+                </strong>
+              </div>
+            </div>
+            <div className="sensitivity-control">
+              <label htmlFor="sensitivity">
+                Mic sensitivity
+                <em>
+                  {sensitivityOffsetDb > 0 ? `+${sensitivityOffsetDb}` : sensitivityOffsetDb} dB
+                </em>
+              </label>
+              <input
+                id="sensitivity"
+                type="range"
+                min={MIN_SENSITIVITY_OFFSET_DB}
+                max={MAX_SENSITIVITY_OFFSET_DB}
+                step={1}
+                value={sensitivityOffsetDb}
+                onChange={(event) => applySensitivity(Number(event.target.value))}
+                aria-describedby="sensitivity-help"
+              />
+              <div className="sensitivity-scale" aria-hidden="true">
+                <span>Reads loud → drag right</span>
+                <span>Reads quiet → drag left</span>
+              </div>
+              <div className="sensitivity-actions">
+                <button
+                  type="button"
+                  className="ghost-button is-small"
+                  onClick={calibrateToCurrentVoice}
+                  disabled={!isListening}
+                  title={
+                    isListening
+                      ? "Speak at your normal volume, then press"
+                      : "Start listening first"
+                  }
+                >
+                  🎚️ Calibrate to my voice
+                </button>
+                <button
+                  type="button"
+                  className="ghost-button is-small"
+                  onClick={() => applySensitivity(0, "Sensitivity reset to default.")}
+                  disabled={sensitivityOffsetDb === 0}
+                >
+                  Reset
+                </button>
+              </div>
+              <p id="sensitivity-help" className="sensitivity-help" role="status">
+                {calibrationMessage ||
+                  "While listening, speak normally and press Calibrate. Everything louder than that reads as raised or shouting."}
+              </p>
+            </div>
+          </details>
           <section className="speech-transcript" aria-live="polite">
             <div className="speech-transcript-header">
               <span>YOUR SPEECH</span>
@@ -699,26 +1236,55 @@ export default function GameClient() {
             </p>
             {recognitionStatus === "listening" && !recognisedTranscript && !interimTranscript && <small>Speak now — waiting for recognised words.</small>}
           </section>
-          <label className="transcript-field">
-            <span>Typed fallback <em>used only when recognition is unavailable or fails</em></span>
-            <textarea value={typedTranscript} onChange={(event) => setTypedTranscript(event.target.value)} placeholder="ചേട്ടാ, 500 രൂപയ്ക്ക് തരുമോ?" rows={2} />
-          </label>
-          {recognitionMessage && <p className="fallback-message" role="status">{recognitionMessage}</p>}
-          {!isListening && (
+          {typedFallbackVisible ? (
+            <>
+              <label className="transcript-field">
+                <span>Typed fallback <em>used only when recognition is unavailable or fails</em></span>
+                <textarea value={typedTranscript} onChange={(event) => setTypedTranscript(event.target.value)} placeholder="ചേട്ടാ, 500 രൂപയ്ക്ക് തരുമോ?" rows={2} />
+              </label>
+              {recognitionMessage && <p className="fallback-message" role="status">{recognitionMessage}</p>}
+              {!isListening && (
+                <button
+                  className="fallback-button"
+                  onClick={() => void settleCurrentRound(true)}
+                  disabled={isGeneratingResponse}
+                >
+                  Settle round with typed text
+                </button>
+              )}
+            </>
+          ) : (
             <button
+              type="button"
               className="fallback-button"
-              onClick={() => void settleCurrentRound(true)}
-              disabled={isGeneratingResponse}
+              onClick={() => setShowTypedFallback(true)}
             >
-              Use typed fallback for this round
+              Rather type than speak?
             </button>
           )}
         </section>
 
         <section className="aggression-panel" aria-live="polite">
           <div className="aggression-title"><div><p>LAST ROUND</p><h2>Aggression score</h2></div><strong>{aggression.score}<small>/100</small></strong></div>
-          <div className="aggression-meter"><i style={{ width: `${aggression.score}%` }} /></div>
-          <div className="metric-row"><span>Volume {aggression.volumeScore}</span><span>Pitch {aggression.pitchScore}</span><span>Pace {aggression.paceScore}{aggression.wordsPerMinute ? ` · ${aggression.wordsPerMinute} WPM` : ""}</span></div>
+          <div
+            className="aggression-meter"
+            role="progressbar"
+            aria-valuenow={aggression.score}
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-label="Last round aggression score"
+          >
+            <i style={{ width: `${aggression.score}%` }} />
+          </div>
+          <div className="metric-row"><span>Volume {aggression.volumeScore}</span><span>Pitch {aggression.pitchScore}</span><span>Pace {aggression.paceScore}{aggression.wordsPerMinute ? ` · ${aggression.wordsPerMinute} WPM` : ""}</span><span>{aggression.volumeSnrDb} dB</span></div>
+          <ol className="mood-scale" aria-label="How aggression maps to the price">
+            <li className={aggression.score <= 18 ? "is-active" : ""}><strong>Calm</strong><span>−₹70</span></li>
+            <li className={aggression.score > 18 && aggression.score <= 32 ? "is-active" : ""}><strong>Polite</strong><span>−₹45</span></li>
+            <li className={aggression.score > 32 && aggression.score <= 46 ? "is-active" : ""}><strong>Measured</strong><span>−₹20</span></li>
+            <li className={aggression.score > 46 && aggression.score <= 58 ? "is-active" : ""}><strong>Neutral</strong><span>hold</span></li>
+            <li className={aggression.score > 58 && aggression.score <= 75 ? "is-active" : ""}><strong>Loud</strong><span>+₹45</span></li>
+            <li className={aggression.score > 75 ? "is-active" : ""}><strong>Shouting</strong><span>+₹90</span></li>
+          </ol>
           <p>Quiet and steady lowers the price. A shouting match makes Ayala costlier.</p>
         </section>
       </section>

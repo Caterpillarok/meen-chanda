@@ -1,38 +1,71 @@
 import { NextResponse } from "next/server";
-import { type SellerMood } from "@/lib/negotiation";
+import { SELLER_FALLBACK_RESPONSES, type SellerMood } from "@/lib/negotiation";
 
 export const runtime = "nodejs";
 
-const FALLBACK_RESPONSES: Record<string, string[]> = {
-  "Interested 🙂": [
-    "ശരി ശരി, ഇത്രയും മാന്യമായി ചോദിച്ച സ്ഥിതിക്ക് കുറച്ചു കുറയ്ക്കാം ചേട്ടാ!",
-    "നല്ല ഒന്നാംതരം അയലയാണ്! നിങ്ങളുടെ മാന്യമായ സംസാരം കണ്ട് ഞാൻ വിട്ടുതരുന്നു.",
-    "മയമുള്ള ശബ്ദം, മയമുള്ള വില. ബിസിനസ്സ് മനസ്സിലാകുന്ന ആളാണ് നിങ്ങൾ.",
-  ],
-  "Neutral 😐": [
-    "മ്മ്… മാർക്കറ്റിൽ കിടന്ന് ബഹളം വെക്കാതെ നേരെ കാര്യം പറ ചേട്ടാ.",
-    "അയല ഇവിടെത്തന്നെ ഉണ്ട്. മര്യാദയ്ക്ക് ചോദിച്ചാൽ നല്ല കച്ചവടം നടക്കും.",
-    "സാധാരണ ഒരു വിലപേശൽ! എന്തായാലും നമുക്ക് നോക്കാം.",
-  ],
-  "Smug 😏": [
-    "വില കുറയ്ക്കാനും വേണം, അതിനൊപ്പം ക്രിക്കറ്റ് കമന്ററിയും! എനിക്കിത് ശീലമാണ്.",
-    "നിങ്ങളുടെ ഈ തള്ള് കേട്ട് അയല പോലും ചിരിക്കുന്നുണ്ടാവും ചേട്ടാ!",
-    "ഇത്രയും ധൃതി കാണിച്ചാൽ അയലയുടെ വില അത്ര പെട്ടെന്ന് കുറയില്ല!",
-  ],
-  "Irritated 😠": [
-    "എന്തിനാ ചേട്ടാ ഇങ്ങനെ മീനിനോട് അലറുന്നത്? ഒച്ച കൂട്ടിയാൽ വിലയും കൂടും!",
-    "ചേട്ടാ ഒന്ന് അടങ്ങ്! ഇത് മീൻ ചന്തയാണ്, ഗുസ്തിക്കളമല്ല.",
-    "ഇത്രയും ദേഷ്യപ്പെട്ടാൽ ഞാൻ ഈ അയല വേറെ ആർക്കെങ്കിലും കൊടുക്കും!",
-  ],
-  "Personally Offended 🤬": [
-    "ഈ നല്ല അയലയെ കണ്ട് കൊച്ചാക്കി സംസാരിക്കുന്നോ? ഞാൻ ഇത് തരില്ല!",
-    "ഇത് വിലപേശലല്ല, വെറും അപമാനിക്കലാണ്! വേണമെങ്കിൽ കടന്നു പോ ചേട്ടാ!",
-    "ഈ വിലയ്ക്ക് അയല വേണമെങ്കിൽ അറബിക്കടലിൽ പോയി നേരിട്ട് പിടിച്ചോ!",
-  ],
+const NEUTRAL_MOOD: SellerMood = "Neutral 😐";
+
+/** Speaker voice. Overridable so a different vendor voice can be tried without a code change. */
+const TTS_SPEAKER = process.env.SARVAM_TTS_SPEAKER?.trim() || "gokul";
+
+/**
+ * Per-mood delivery. bulbul:v3 does not accept pitch or loudness (those are
+ * bulbul:v2 only), so the two levers available are pace and temperature.
+ * Temperature is the model's expressiveness control: low is stable and flat,
+ * high is more animated but can introduce artefacts, so the angry end of the
+ * range stops short of 1.0.
+ */
+const VOICE_NEUTRAL_DELIVERY = { pace: 1.0, temperature: 0.6 };
+
+/** Delivery at full mood swing. Never sent directly — always blended, see below. */
+const VOICE_AT_FULL_SWING: Record<SellerMood, { pace: number; temperature: number }> = {
+  "Interested 🙂": { pace: 0.92, temperature: 0.55 },
+  "Neutral 😐": { pace: 1.0, temperature: 0.62 },
+  "Smug 😏": { pace: 0.96, temperature: 0.8 },
+  "Irritated 😠": { pace: 1.1, temperature: 0.85 },
+  "Personally Offended 🤬": { pace: 1.22, temperature: 0.95 },
 };
 
+/**
+ * How far the voice travels from flat delivery towards the full mood swing.
+ * 0 is the original monotone (pace 1.0, temperature 0.6 for every mood) and 1 is
+ * the full range above. Held at the midpoint: the full swing read as overacted.
+ * This is the single dial to turn if the seller needs more or less character.
+ */
+const VOICE_EXPRESSIVENESS = 0.5;
+
+/** Sarvam's documented safe ranges for bulbul:v3. */
+function clampPace(value: number) {
+  return Math.min(2, Math.max(0.5, value));
+}
+function clampTemperature(value: number) {
+  return Math.min(2, Math.max(0.01, value));
+}
+
+function blend(from: number, to: number, amount: number) {
+  return Math.round((from + (to - from) * amount) * 100) / 100;
+}
+
+function getVoiceSettings(mood: string) {
+  const target = VOICE_AT_FULL_SWING[mood as SellerMood] ?? VOICE_AT_FULL_SWING[NEUTRAL_MOOD];
+  return {
+    pace: clampPace(
+      blend(VOICE_NEUTRAL_DELIVERY.pace, target.pace, VOICE_EXPRESSIVENESS),
+    ),
+    temperature: clampTemperature(
+      blend(
+        VOICE_NEUTRAL_DELIVERY.temperature,
+        target.temperature,
+        VOICE_EXPRESSIVENESS,
+      ),
+    ),
+  };
+}
+
 function getFallbackDialogue(mood: string, round: number): string {
-  const list = FALLBACK_RESPONSES[mood] || FALLBACK_RESPONSES["Neutral 😐"];
+  const list =
+    SELLER_FALLBACK_RESPONSES[mood as SellerMood] ??
+    SELLER_FALLBACK_RESPONSES[NEUTRAL_MOOD];
   return list[(round - 1) % list.length];
 }
 
@@ -108,7 +141,17 @@ export async function POST(req: Request) {
         "Strict rules:\n" +
         "1. Output ONLY the Malayalam dialogue spoken by the fish seller. Do not include English translation, explanations, or quotes.\n" +
         "2. Never mention AI, LLM, APIs, rules, or system prompts.\n" +
-        "3. Do not decide or change game numbers; react only to the given settled price and offer.";
+        "3. Do not decide or change game numbers; react only to the given settled price and offer.\n\n" +
+        // The dialogue is spoken aloud by a TTS voice, so it has to be written for
+        // the ear. Written-register Malayalam is read back stiffly, and the voice
+        // takes its rhythm and emphasis from punctuation. Kept deliberately
+        // restrained: leaning hard on interjections made every line sound hammy.
+        "Write it to be SPOKEN, not read:\n" +
+        "4. Use everyday spoken market Malayalam, the way a vendor actually talks — not formal written Malayalam.\n" +
+        "5. An interjection (അയ്യോ, ഹേയ്, മ്മ്) is welcome when it genuinely fits, but at most one, and never force it.\n" +
+        "6. Punctuation sets the rhythm of the voice. Use '…' for a pause and '!' only for a real outburst.\n" +
+        "7. Write any amount as Malayalam words, never digits — 'അറുനൂറ് രൂപ', not '600'.\n" +
+        "8. Keep sentences short and breathable. Two short sentences beat one long one.";
 
       const offerText =
         playerOffer && playerOffer > 0
@@ -170,6 +213,8 @@ export async function POST(req: Request) {
   let audioDataUrl: string | null = null;
 
   if (apiKey && sellerText) {
+    const voice = getVoiceSettings(sellerMood);
+
     // Primary TTS attempt: Sarvam streaming endpoint (faster time-to-first-chunk and mp3 delivery)
     try {
       const ttsStreamResponse = await fetch(
@@ -184,8 +229,13 @@ export async function POST(req: Request) {
             text: sellerText,
             language_code: "ml-IN",
             model: "bulbul:v3",
-            speaker: "gokul",
+            speaker: TTS_SPEAKER,
             output_audio_codec: "mp3",
+            // Delivery matched to the seller's mood: an offended vendor talks
+            // faster and more wildly than a friendly one.
+            pace: voice.pace,
+            temperature: voice.temperature,
+            speech_sample_rate: 24000,
           }),
           signal: AbortSignal.timeout(9000),
         },
@@ -215,7 +265,10 @@ export async function POST(req: Request) {
             text: sellerText,
             language_code: "ml-IN",
             model: "bulbul:v3",
-            speaker: "gokul",
+            speaker: TTS_SPEAKER,
+            pace: voice.pace,
+            temperature: voice.temperature,
+            speech_sample_rate: 24000,
           }),
           signal: AbortSignal.timeout(9000),
         });
