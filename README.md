@@ -157,11 +157,11 @@ Not applicable — no hardware build.
 
 ### Project Demo
 # Video
-[Add your demo video link here]
-*Suggested run of show: play one round speaking softly and politely and watch the price
-fall, then play the next round shouting the same offer and watch the seller flip to
-`Personally Offended 🤬` and the price climb past the starting price. That contrast is the
-whole project in 30 seconds.*
+[
+
+https://github.com/user-attachments/assets/23728474-3bd5-4092-bdae-15f5ee6fba90
+
+]
 
 # Additional Demos
 - Try it with `SARVAM_API_KEY` removed to see the offline Malayalam fallback lines.
