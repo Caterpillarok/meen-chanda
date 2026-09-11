@@ -2,6 +2,12 @@ import { NextResponse } from "next/server";
 import { SELLER_FALLBACK_RESPONSES, type SellerMood } from "@/lib/negotiation";
 
 export const runtime = "nodejs";
+/**
+ * Dialogue generation and speech synthesis run in sequence, each allowed up to 9s,
+ * so the worst case sits above the platform's default 10s function limit. Raising
+ * the ceiling avoids a timeout returning a 504 instead of a seller reply.
+ */
+export const maxDuration = 30;
 
 const NEUTRAL_MOOD: SellerMood = "Neutral 😐";
 
