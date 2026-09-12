@@ -96,14 +96,14 @@ Other scripts: `npm run build`, `npm run start`, `npm run lint`.
 For Software:
 
 # Screenshots 
-![Screenshot1](Initial page)
+(Initial page)
 *<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/d5918240-93ba-48ce-b9bc-76192852787c" />
 
 
-![Screenshot2](Haggle meter)
+(Haggle meter)
 <img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/c8f76984-3488-404b-98ec-b94a94d90f75" />
 
-![Screenshot3](score)
+(score)
 <img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/01422b8e-50b9-496f-9e58-9de47aedf5ad" />
 
 
@@ -158,6 +158,7 @@ Not applicable — no hardware build.
 
 https://github.com/user-attachments/assets/23728474-3bd5-4092-bdae-15f5ee6fba90
 
+meen-chanda.mp4
 ]
 
 # Additional Demos
